@@ -4,15 +4,5 @@
 
 .lan-scanner-header .button {
     padding: 5px 15px;
-    background-color: #2e3436;
     border-radius: 4px;
-    border: 1px solid #1c1f1f;
-}
-
-.lan-scanner-header .button:hover {
-    background-color: #3d4143;
-}
-
-.lan-scanner-header .button:active {
-    background-color: #232527;
 }
