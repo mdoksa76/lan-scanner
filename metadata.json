@@ -1,0 +1,15 @@
+{
+  "name": "LAN Scanner",
+  "description": "Skenira lokalnu mrežu i prikazuje spojene uređaje (IP, MAC, hostname)",
+  "uuid": "lan-scanner@mdoksa76.github.com",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49"
+  ],
+  "version": 1,
+  "url": "",
+  "settings-schema": ""
+}
