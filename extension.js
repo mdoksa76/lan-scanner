@@ -20,6 +20,7 @@ class LANScanner extends PanelMenu.Button {
         this._myMac = null;
         this._activePings = 0;
         this._maxConcurrent = 50;
+        this._pendingTimeouts = [];
         
         // Ikona i label
         let box = new St.BoxLayout();
@@ -106,32 +107,43 @@ class LANScanner extends PanelMenu.Button {
     
     _detectSubnet() {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync('ip -4 addr show');
-            if (ok) {
-                let output = new TextDecoder().decode(out);
-                let lines = output.split('\n');
-                for (let line of lines) {
-                    let match = line.match(/inet ([\d.]+)\/(\d+)/);
-                    if (match && !match[1].startsWith('127.')) {
-                        this._myIP = match[1];
-                        let cidr = match[2];
-                        let parts = this._myIP.split('.');
-                        this._subnet = `${parts[0]}.${parts[1]}.${parts[2]}.0/${cidr}`;
-                        this._subnetEntry.set_text(this._subnet);
-                        this._updateStatus(`Detected subnet: ${this._subnet}`);
-                        this._myMac = this._getMyMacAddress();
-                        return;
+            let proc = Gio.Subprocess.new(
+                ['ip', '-4', 'addr', 'show'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let lines = stdout.split('\n');
+                        for (let line of lines) {
+                            let match = line.match(/inet ([\d.]+)\/(\d+)/);
+                            if (match && !match[1].startsWith('127.')) {
+                                this._myIP = match[1];
+                                let cidr = match[2];
+                                let parts = this._myIP.split('.');
+                                this._subnet = `${parts[0]}.${parts[1]}.${parts[2]}.0/${cidr}`;
+                                this._subnetEntry.set_text(this._subnet);
+                                this._updateStatus(`Detected subnet: ${this._subnet}`);
+                                this._getMyMacAddress((mac) => { this._myMac = mac; });
+                                return;
+                            }
+                        }
                     }
+                } catch (e) {
+                    log(`Greška pri detekciji: ${e}`);
                 }
-            }
+                this._subnet = '192.168.1.0/24';
+                this._subnetEntry.set_text(this._subnet);
+                this._updateStatus('Use default subnet');
+                this._getMyMacAddress((mac) => { this._myMac = mac; });
+            });
         } catch (e) {
             log(`Greška pri detekciji: ${e}`);
+            this._subnet = '192.168.1.0/24';
+            this._subnetEntry.set_text(this._subnet);
+            this._updateStatus('Use default subnet');
         }
-        
-        this._subnet = '192.168.1.0/24';
-        this._subnetEntry.set_text(this._subnet);
-        this._updateStatus('Use default subnet');
-        this._myMac = this._getMyMacAddress();
     }
     
     _startScan() {
@@ -293,46 +305,72 @@ class LANScanner extends PanelMenu.Button {
     }
     
     _getMACFromARP(ip, callback) {
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+        let tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            this._pendingTimeouts = (this._pendingTimeouts || []).filter(id => id !== tid);
+
+            let proc = null;
             try {
-                let [ok, out] = GLib.spawn_command_line_sync('ip neigh show');
-                if (ok) {
-                    let output = new TextDecoder().decode(out);
-                    let lines = output.split('\n');
-                    
-                    for (let line of lines) {
-                        if (line.includes(ip)) {
-                            let match = line.match(/lladdr\s+([\w:]+)/);
-                            if (match) {
-                                callback(match[1].toLowerCase());
-                                return;
+                proc = Gio.Subprocess.new(
+                    ['ip', 'neigh', 'show'],
+                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+                );
+            } catch (e) {}
+
+            if (proc) {
+                proc.communicate_utf8_async(null, null, (proc, res) => {
+                    try {
+                        let [, stdout] = proc.communicate_utf8_finish(res);
+                        if (stdout) {
+                            for (let line of stdout.split('\n')) {
+                                if (line.includes(ip)) {
+                                    let match = line.match(/lladdr\s+([\w:]+)/);
+                                    if (match) {
+                                        callback(match[1].toLowerCase());
+                                        return;
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-            } catch (e) {}
-            
-            try {
-                let [ok, out] = GLib.spawn_command_line_sync(`arp -n ${ip}`);
-                if (ok) {
-                    let output = new TextDecoder().decode(out);
-                    let lines = output.split('\n');
-                    
-                    for (let line of lines) {
-                        if (line.includes(ip)) {
-                            let match = line.match(/([\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2})/);
-                            if (match) {
-                                callback(match[1].toLowerCase());
-                                return;
-                            }
-                        }
-                    }
-                }
-            } catch (e) {}
-            
-            callback(null);
+                    } catch (e) {}
+                    // Fallback: arp -n
+                    this._getMACFromARPFallback(ip, callback);
+                });
+            } else {
+                this._getMACFromARPFallback(ip, callback);
+            }
+
             return GLib.SOURCE_REMOVE;
         });
+        this._pendingTimeouts = (this._pendingTimeouts || []);
+        this._pendingTimeouts.push(tid);
+    }
+
+    _getMACFromARPFallback(ip, callback) {
+        try {
+            let proc = Gio.Subprocess.new(
+                ['arp', '-n', ip],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        for (let line of stdout.split('\n')) {
+                            if (line.includes(ip)) {
+                                let match = line.match(/([\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2}:[\w:]{2})/);
+                                if (match) {
+                                    callback(match[1].toLowerCase());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _getFullDeviceInfo(ip, mac, isLocal, callback) {
@@ -425,69 +463,107 @@ class LANScanner extends PanelMenu.Button {
     
     _getHostnameViaGetent(ip, callback) {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync(`getent hosts ${ip}`);
-            if (ok) {
-                let output = new TextDecoder().decode(out).trim();
-                let parts = output.split(/\s+/);
-                if (parts.length > 1 && parts[1] !== ip) {
-                    let hostname = parts[1];
-                    callback(hostname.endsWith('.local') ? hostname.replace('.local', '') : hostname);
-                    return;
-                }
-            }
-        } catch (e) {}
-        callback(null);
+            let proc = Gio.Subprocess.new(
+                ['getent', 'hosts', ip],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let output = stdout.trim();
+                        let parts = output.split(/\s+/);
+                        if (parts.length > 1 && parts[1] !== ip) {
+                            let hostname = parts[1];
+                            callback(hostname.endsWith('.local') ? hostname.replace('.local', '') : hostname);
+                            return;
+                        }
+                    }
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _getHostnameViaNMBLookup(ip, callback) {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync(`timeout 1 nmblookup -A ${ip} 2>/dev/null`);
-            if (ok) {
-                let output = new TextDecoder().decode(out);
-                let lines = output.split('\n');
-                for (let line of lines) {
-                    if (line.includes('<00>') && line.includes('UNIQUE')) {
-                        let match = line.match(/\s+([^\s]+)\s+<00>/);
-                        if (match && match[1] && match[1].length > 1) {
-                            callback(match[1]);
-                            return;
+            let proc = Gio.Subprocess.new(
+                ['timeout', '1', 'nmblookup', '-A', ip],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        for (let line of stdout.split('\n')) {
+                            if (line.includes('<00>') && line.includes('UNIQUE')) {
+                                let match = line.match(/\s+([^\s]+)\s+<00>/);
+                                if (match && match[1] && match[1].length > 1) {
+                                    callback(match[1]);
+                                    return;
+                                }
+                            }
                         }
                     }
-                }
-            }
-        } catch (e) {}
-        callback(null);
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _getHostnameViaAvahi(ip, callback) {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync(`avahi-resolve-address ${ip} 2>/dev/null`);
-            if (ok) {
-                let output = new TextDecoder().decode(out).trim();
-                if (output) {
-                    let parts = output.split(/\t/);
-                    if (parts.length > 1 && parts[1] && parts[1] !== ip) {
-                        callback(parts[1].replace('.local', ''));
-                        return;
+            let proc = Gio.Subprocess.new(
+                ['avahi-resolve-address', ip],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let output = stdout.trim();
+                        if (output) {
+                            let parts = output.split(/\t/);
+                            if (parts.length > 1 && parts[1] && parts[1] !== ip) {
+                                callback(parts[1].replace('.local', ''));
+                                return;
+                            }
+                        }
                     }
-                }
-            }
-        } catch (e) {}
-        callback(null);
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _getHostnameViaDNS(ip, callback) {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync(`dig +short -x ${ip} 2>/dev/null`);
-            if (ok) {
-                let output = new TextDecoder().decode(out).trim();
-                if (output && output.length > 0 && output !== ip) {
-                    callback(output.replace(/\.$/, ''));
-                    return;
-                }
-            }
-        } catch (e) {}
-        callback(null);
+            let proc = Gio.Subprocess.new(
+                ['dig', '+short', '-x', ip],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let output = stdout.trim();
+                        if (output && output.length > 0 && output !== ip) {
+                            callback(output.replace(/\.$/, ''));
+                            return;
+                        }
+                    }
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _detectOS(ip, callback) {
@@ -530,21 +606,33 @@ class LANScanner extends PanelMenu.Button {
         };
         
         // Provjeri TTL iz ping odgovora
+        let proc = null;
         try {
-            let [ok, out] = GLib.spawn_command_line_sync(`ping -c 1 ${ip} 2>/dev/null | grep -o "ttl=\\d+"`);
-            if (ok) {
-                let output = new TextDecoder().decode(out).trim();
-                let ttlMatch = output.match(/ttl=(\d+)/);
-                if (ttlMatch) {
-                    let ttl = parseInt(ttlMatch[1]);
-                    if (ttl <= 64 && !detectedOS) detectedOS = 'Linux/Unix';
-                    if (ttl === 128 && !detectedOS) detectedOS = 'Windows';
-                    if (ttl >= 255 && !detectedOS) detectedOS = 'Router/Switch';
-                }
-            }
+            proc = Gio.Subprocess.new(
+                ['/bin/sh', '-c', `ping -c 1 ${ip} 2>/dev/null | grep -o "ttl=[0-9]*"`],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
         } catch (e) {}
-        
-        checkPort(0);
+
+        if (proc) {
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let ttlMatch = stdout.trim().match(/ttl=(\d+)/);
+                        if (ttlMatch) {
+                            let ttl = parseInt(ttlMatch[1]);
+                            if (ttl <= 64 && !detectedOS) detectedOS = 'Linux/Unix';
+                            if (ttl === 128 && !detectedOS) detectedOS = 'Windows';
+                            if (ttl >= 255 && !detectedOS) detectedOS = 'Router/Switch';
+                        }
+                    }
+                } catch (e) {}
+                checkPort(0);
+            });
+        } else {
+            checkPort(0);
+        }
     }
     
     _getVendorFromMAC(mac, callback) {
@@ -631,23 +719,35 @@ class LANScanner extends PanelMenu.Button {
         return 'generic';
     }
     
-    _getMyMacAddress() {
+    _getMyMacAddress(callback) {
         try {
-            let [ok, out] = GLib.spawn_command_line_sync('ip link show');
-            if (ok) {
-                let output = new TextDecoder().decode(out);
-                let lines = output.split('\n');
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i].includes('state UP') && !lines[i].includes('lo:')) {
-                        if (i + 1 < lines.length) {
-                            let match = lines[i + 1].match(/link\/ether ([\w:]+)/);
-                            if (match) return match[1];
+            let proc = Gio.Subprocess.new(
+                ['ip', 'link', 'show'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    let [, stdout] = proc.communicate_utf8_finish(res);
+                    if (stdout) {
+                        let lines = stdout.split('\n');
+                        for (let i = 0; i < lines.length; i++) {
+                            if (lines[i].includes('state UP') && !lines[i].includes('lo:')) {
+                                if (i + 1 < lines.length) {
+                                    let match = lines[i + 1].match(/link\/ether ([\w:]+)/);
+                                    if (match) {
+                                        callback(match[1]);
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
-        } catch (e) {}
-        return null;
+                } catch (e) {}
+                callback(null);
+            });
+        } catch (e) {
+            callback(null);
+        }
     }
     
     _displayDevices() {
@@ -847,6 +947,10 @@ class LANScanner extends PanelMenu.Button {
     }
     
     destroy() {
+        if (this._pendingTimeouts) {
+            this._pendingTimeouts.forEach(id => GLib.source_remove(id));
+            this._pendingTimeouts = [];
+        }
         super.destroy();
     }
 });
