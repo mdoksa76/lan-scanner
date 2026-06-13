@@ -21,6 +21,7 @@ class LANScanner extends PanelMenu.Button {
         this._activePings = 0;
         this._maxConcurrent = 50;
         this._pendingTimeouts = [];
+        this._cancellable = new Gio.Cancellable();
         
         // Ikona i label
         let box = new St.BoxLayout();
@@ -111,7 +112,7 @@ class LANScanner extends PanelMenu.Button {
                 ['ip', '-4', 'addr', 'show'],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -272,15 +273,17 @@ class LANScanner extends PanelMenu.Button {
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
             
-            proc.wait_async(null, (proc, result) => {
+            proc.wait_async(this._cancellable, (proc, result) => {
                 if (completed) return;
                 completed = true;
                 
                 if (timeoutId) {
                     GLib.source_remove(timeoutId);
+                    this._pendingTimeouts = (this._pendingTimeouts || []).filter(id => id !== timeoutId);
                 }
                 
                 try {
+                    proc.wait_finish(result);
                     callback(proc.get_successful());
                 } catch (e) {
                     callback(false);
@@ -289,6 +292,7 @@ class LANScanner extends PanelMenu.Button {
             
             // Timeout za svaki slučaj
             timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
+                this._pendingTimeouts = (this._pendingTimeouts || []).filter(id => id !== timeoutId);
                 if (!completed) {
                     completed = true;
                     try {
@@ -298,6 +302,8 @@ class LANScanner extends PanelMenu.Button {
                 }
                 return GLib.SOURCE_REMOVE;
             });
+            this._pendingTimeouts = (this._pendingTimeouts || []);
+            this._pendingTimeouts.push(timeoutId);
             
         } catch (e) {
             callback(false);
@@ -308,6 +314,11 @@ class LANScanner extends PanelMenu.Button {
         let tid = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             this._pendingTimeouts = (this._pendingTimeouts || []).filter(id => id !== tid);
 
+            // Ako je ekstenzija ugašena, prekini
+            if (!this._cancellable || this._cancellable.is_cancelled()) {
+                return GLib.SOURCE_REMOVE;
+            }
+
             let proc = null;
             try {
                 proc = Gio.Subprocess.new(
@@ -317,7 +328,7 @@ class LANScanner extends PanelMenu.Button {
             } catch (e) {}
 
             if (proc) {
-                proc.communicate_utf8_async(null, null, (proc, res) => {
+                proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                     try {
                         let [, stdout] = proc.communicate_utf8_finish(res);
                         if (stdout) {
@@ -351,7 +362,7 @@ class LANScanner extends PanelMenu.Button {
                 ['arp', '-n', ip],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -467,7 +478,7 @@ class LANScanner extends PanelMenu.Button {
                 ['getent', 'hosts', ip],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -493,7 +504,7 @@ class LANScanner extends PanelMenu.Button {
                 ['timeout', '1', 'nmblookup', '-A', ip],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -521,7 +532,7 @@ class LANScanner extends PanelMenu.Button {
                 ['avahi-resolve-address', ip],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -548,7 +559,7 @@ class LANScanner extends PanelMenu.Button {
                 ['dig', '+short', '-x', ip],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -585,16 +596,22 @@ class LANScanner extends PanelMenu.Button {
                     Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
                 );
                 
-                proc.wait_async(null, (proc, result) => {
+                proc.wait_async(this._cancellable, (proc, result) => {
                     checksDone++;
                     
                     try {
+                        proc.wait_finish(result);
                         if (proc.get_successful()) {
                             if (port === 22 && !detectedOS) detectedOS = 'Linux/Unix';
                             if (port === 3389 && !detectedOS) detectedOS = 'Windows';
                             if (port === 5353 && !detectedOS) detectedOS = 'Apple';
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        // Otkazano ili greška — prekini lanac ako je cancellable aktivan
+                        if (e.matches && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+                            return;
+                        }
+                    }
                     
                     checkPort(portIndex + 1);
                 });
@@ -615,7 +632,7 @@ class LANScanner extends PanelMenu.Button {
         } catch (e) {}
 
         if (proc) {
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -725,7 +742,7 @@ class LANScanner extends PanelMenu.Button {
                 ['ip', 'link', 'show'],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
+            proc.communicate_utf8_async(null, this._cancellable, (proc, res) => {
                 try {
                     let [, stdout] = proc.communicate_utf8_finish(res);
                     if (stdout) {
@@ -947,6 +964,11 @@ class LANScanner extends PanelMenu.Button {
     }
     
     destroy() {
+        // Otkaži sve async subprocese
+        if (this._cancellable) {
+            this._cancellable.cancel();
+            this._cancellable = null;
+        }
         if (this._pendingTimeouts) {
             this._pendingTimeouts.forEach(id => GLib.source_remove(id));
             this._pendingTimeouts = [];
