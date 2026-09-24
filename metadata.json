@@ -1,0 +1,14 @@
+{
+  "name": "LAN Scanner",
+  "description": "Scans local network and displays connected devices (IP, MAC, hostname)",
+  "uuid": "lan-scanner@mdoksa76.github.com",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "url": "https://github.com/mdoksa76/lan-scanner"
+}
