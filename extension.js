@@ -7,21 +7,25 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const LANScanner = GObject.registerClass(
-class LANScanner extends QuickSettings.QuickMenuToggle {
-    _init() {
+const LanWindow = GObject.registerClass(
+class LanWindow extends St.BoxLayout {
+    _init(onStateChange) {
         super._init({
-            title: 'LAN Scanner',
-            subtitle: '0',
-            iconName: 'network-workgroup-symbolic',
-            toggleMode: false,
+            vertical: true,
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style_class: 'lan-scanner-window',
+            style: 'background-color: rgba(30,30,30,0.98); ' +
+                   'border: 1px solid rgba(255,255,255,0.15); ' +
+                   'border-radius: 12px; padding: 12px; ' +
+                   'min-width: 640px; max-width: 720px;'
         });
 
-        this.connect('clicked', () => this._startScan());
+        this._onStateChange = onStateChange;
 
         this._devices = [];
         this._scanning = false;
@@ -33,83 +37,157 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
         this._pendingTimeouts = [];
         this._cancellable = new Gio.Cancellable();
 
-        this.menu.setHeader('network-workgroup-symbolic', 'LAN Scanner');
+        this._buildUI();
 
-        this._createHeader();
-        this._deviceSection = new PopupMenu.PopupMenuSection();
-        this.menu.addMenuItem(this._deviceSection);
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._statusItem = new PopupMenu.PopupMenuItem('Click "Scan" for start', {
-            reactive: false
-        });
-        this.menu.addMenuItem(this._statusItem);
-        
+        Main.layoutManager.uiGroup.add_child(this);
+        this.hide();
+
         this._detectSubnet();
     }
-    
-    _createHeader() {
-        let headerBox = new St.BoxLayout({
-            vertical: true,
-            style_class: 'lan-scanner-header'
+
+    _buildUI() {
+        let titleBar = new St.BoxLayout({
+            style: 'spacing: 8px; padding-bottom: 8px;'
         });
 
-        let titleLabel = new St.Label({
-            text: 'LAN Scanner',
-            style: 'font-weight: bold; font-size: 1.1em; padding: 5px 10px;',
-            x_align: Clutter.ActorAlign.CENTER
+        this._titleLabel = new St.Label({
+            text: '🖧  LAN Scanner',
+            y_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
+            style: 'font-weight: bold; font-size: 1.15em;'
         });
-        headerBox.add_child(titleLabel);
 
-        let subnetBox = new St.BoxLayout({
-            style: 'spacing: 10px; padding: 10px;'
+        let closeButton = new St.Button({
+            label: '✕',
+            style_class: 'button',
+            style: 'padding: 2px 10px; border-radius: 4px;'
         });
-        
+        closeButton.connect('clicked', () => this.close());
+
+        titleBar.add_child(this._titleLabel);
+        titleBar.add_child(closeButton);
+        this.add_child(titleBar);
+
+        // Drag prozora po naslovnoj traci
+        this._titleLabel.reactive = true;
+        this._titleLabel.connect('button-press-event', (a, ev) => this._onDragStart(ev));
+
+        // Kontrole: subnet + gumbi
+        let controls = new St.BoxLayout({
+            style: 'spacing: 10px; padding: 6px 0;'
+        });
+
         let subnetLabel = new St.Label({
             text: 'Subnet:',
             y_align: Clutter.ActorAlign.CENTER
         });
-        
+
         this._subnetEntry = new St.Entry({
             hint_text: '192.168.1.0/24',
             can_focus: true,
             track_hover: true,
-            style: 'width: 150px;'
+            style: 'width: 180px;'
         });
-        
-        subnetBox.add_child(subnetLabel);
-        subnetBox.add_child(this._subnetEntry);
-        
-        let buttonBox = new St.BoxLayout({
-            style: 'spacing: 5px; padding: 5px 10px;'
-        });
-        
+
         this._scanButton = new St.Button({
             label: 'Scan',
-            style_class: 'button'
+            style_class: 'button',
+            style: 'padding: 5px 15px; border-radius: 4px;'
         });
         this._scanButton.connect('clicked', () => this._startScan());
-        
+
         this._detectButton = new St.Button({
             label: 'Auto',
-            style_class: 'button'
+            style_class: 'button',
+            style: 'padding: 5px 15px; border-radius: 4px;'
         });
         this._detectButton.connect('clicked', () => this._detectSubnet());
-        
-        buttonBox.add_child(this._scanButton);
-        buttonBox.add_child(this._detectButton);
-        
-        headerBox.add_child(subnetBox);
-        headerBox.add_child(buttonBox);
-        
-        let headerItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            can_focus: false
+
+        controls.add_child(subnetLabel);
+        controls.add_child(this._subnetEntry);
+        controls.add_child(this._scanButton);
+        controls.add_child(this._detectButton);
+        this.add_child(controls);
+
+        // Rezultati u scrollu
+        let scroll = new St.ScrollView({
+            style: 'max-height: 620px;',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            y_expand: true
         });
-        headerItem.add_child(headerBox);
-        this.menu.addMenuItem(headerItem);
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._resultsBox = new St.BoxLayout({vertical: true});
+        scroll.set_child(this._resultsBox);
+        this.add_child(scroll);
+
+        // Statusni redak
+        this._statusLabel = new St.Label({
+            text: 'Click "Scan" to start',
+            style: 'padding-top: 8px; color: #aaa; font-size: 0.9em;'
+        });
+        this.add_child(this._statusLabel);
     }
-    
+
+    _onDragStart(ev) {
+        let [sx, sy] = ev.get_coords();
+        let [wx, wy] = this.get_position();
+        this._dragOffset = [sx - wx, sy - wy];
+
+        this._dragMotionId = global.stage.connect('motion-event', (s, mev) => {
+            let [mx, my] = mev.get_coords();
+            this.set_position(
+                Math.round(mx - this._dragOffset[0]),
+                Math.round(my - this._dragOffset[1])
+            );
+            return Clutter.EVENT_STOP;
+        });
+        this._dragReleaseId = global.stage.connect('button-release-event', () => {
+            if (this._dragMotionId) {
+                global.stage.disconnect(this._dragMotionId);
+                this._dragMotionId = null;
+            }
+            if (this._dragReleaseId) {
+                global.stage.disconnect(this._dragReleaseId);
+                this._dragReleaseId = null;
+            }
+            return Clutter.EVENT_STOP;
+        });
+        return Clutter.EVENT_STOP;
+    }
+
+    _setSubtitle(text) {
+        if (this._onStateChange)
+            this._onStateChange(text);
+    }
+
+    open() {
+        let monitor = Main.layoutManager.primaryMonitor;
+        this.show();
+        let w = this.width;
+        let h = this.height;
+        this.set_position(
+            Math.round(monitor.x + (monitor.width - w) / 2),
+            Math.round(monitor.y + (monitor.height - h) / 2)
+        );
+        this._isOpen = true;
+        if (this._onOpenChange)
+            this._onOpenChange(true);
+    }
+
+    close() {
+        this.hide();
+        this._isOpen = false;
+        if (this._onOpenChange)
+            this._onOpenChange(false);
+    }
+
+    toggle() {
+        if (this._isOpen)
+            this.close();
+        else
+            this.open();
+    }
+
     _detectSubnet() {
         try {
             let proc = Gio.Subprocess.new(
@@ -162,10 +240,10 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
         this._devices = [];
         this._pendingTimeouts.forEach(id => GLib.source_remove(id));
         this._pendingTimeouts = [];
-        this._deviceSection.removeAll();
+        this._resultsBox.destroy_all_children();
         this._scanButton.set_label('Scanning ...');
         this._updateStatus('Start scanning ...');
-        this.subtitle = '...';
+        this._setSubtitle('scanning…');
         
         let [baseIP, mask] = subnet.split('/');
         let parts = baseIP.split('.');
@@ -785,14 +863,15 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
     }
     
     _displayDevices() {
-        this._deviceSection.removeAll();
+        this._resultsBox.destroy_all_children();
         
         if (this._devices.length === 0) {
-            let item = new PopupMenu.PopupMenuItem('“No devices found.', {
-                reactive: false
+            let empty = new St.Label({
+                text: 'No devices found.',
+                style: 'padding: 10px;'
             });
-            this._deviceSection.addMenuItem(item);
-            this.subtitle = '0';
+            this._resultsBox.add_child(empty);
+            this._setSubtitle('0');
             return;
         }
         
@@ -800,12 +879,6 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
             let aNum = parseInt(a.ip.split('.')[3]);
             let bNum = parseInt(b.ip.split('.')[3]);
             return aNum - bNum;
-        });
-        
-        let scrollView = new St.ScrollView({
-            style: 'max-height: 600px; min-width: 600px;',
-            hscrollbar_policy: St.PolicyType.NEVER,
-            vscrollbar_policy: St.PolicyType.AUTOMATIC
         });
         
         let mainBox = new St.BoxLayout({
@@ -849,16 +922,9 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
             mainBox.add_child(rowBox);
         }
         
-        scrollView.set_child(mainBox);
+        this._resultsBox.add_child(mainBox);
         
-        let scrollItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            can_focus: false
-        });
-        scrollItem.add_child(scrollView);
-        this._deviceSection.addMenuItem(scrollItem);
-        
-        this.subtitle = this._devices.length.toString();
+        this._setSubtitle(this._devices.length.toString());
     }
     
     _createDeviceBox(device) {
@@ -959,10 +1025,19 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
     }
     
     _updateStatus(text) {
-        this._statusItem.label.set_text(text);
+        if (this._statusLabel)
+            this._statusLabel.set_text(text);
     }
     
     destroy() {
+        if (this._dragMotionId) {
+            global.stage.disconnect(this._dragMotionId);
+            this._dragMotionId = null;
+        }
+        if (this._dragReleaseId) {
+            global.stage.disconnect(this._dragReleaseId);
+            this._dragReleaseId = null;
+        }
         if (this._cancellable) {
             this._cancellable.cancel();
             this._cancellable = null;
@@ -970,6 +1045,35 @@ class LANScanner extends QuickSettings.QuickMenuToggle {
         if (this._pendingTimeouts) {
             this._pendingTimeouts.forEach(id => GLib.source_remove(id));
             this._pendingTimeouts = [];
+        }
+        super.destroy();
+    }
+});
+
+const LANScanner = GObject.registerClass(
+class LANScanner extends QuickSettings.QuickToggle {
+    _init() {
+        super._init({
+            title: 'LAN Scanner',
+            subtitle: '0',
+            iconName: 'network-workgroup-symbolic',
+            toggleMode: false,
+        });
+
+        this._window = new LanWindow((subtitle) => {
+            this.subtitle = subtitle;
+        });
+        this._window._onOpenChange = (isOpen) => {
+            this.checked = isOpen;
+        };
+
+        this.connect('clicked', () => this._window.toggle());
+    }
+
+    destroy() {
+        if (this._window) {
+            this._window.destroy();
+            this._window = null;
         }
         super.destroy();
     }
