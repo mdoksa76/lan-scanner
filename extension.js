@@ -164,10 +164,10 @@ class LanWindow extends St.BoxLayout {
         let monitor = Main.layoutManager.primaryMonitor;
         this.show();
         let w = this.width;
-        let h = this.height;
+        let topGap = Main.panel.height + 12;
         this.set_position(
             Math.round(monitor.x + (monitor.width - w) / 2),
-            Math.round(monitor.y + (monitor.height - h) / 2)
+            Math.round(monitor.y + topGap)
         );
         this._isOpen = true;
         if (this._onOpenChange)
